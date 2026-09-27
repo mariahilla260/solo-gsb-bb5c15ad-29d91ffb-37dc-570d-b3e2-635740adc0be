@@ -1,6 +1,6 @@
 # Live Subtitle Finalizer — 直播字幕定稿服务
 
-基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择；需要一次改多处时还可调用**批量更正接口**：单事务内逐项核对、全部通过才按输入顺序追加，任一项失败整批零写入，并以频道范围内的幂等键支持安全重试。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照；任意两个同频道快照还可经**快照差异接口**按 seq 合并比较，只返回新增 / 移除 / 内容变更的条目。快照内容如需合规输出，可调用**快照敏感词遮盖**：基于冻结生效文本在整个快照上按码点精确匹配词表，命中码点替换为 `*` 后分页返回，全程只读。下游也可以注册**命名消费者拉取游标**：每个命名消费者在频道内持有独立的已确认游标，领取接口在事务中返回游标后的连续批次（含缺口标记）并签发带过期时间的租约令牌，确认后游标才推进；租约过期未确认的批次可被重新领取，实现至少一次交付。
+基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择；需要一次改多处时还可调用**批量更正接口**：单事务内逐项核对、全部通过才按输入顺序追加，任一项失败整批零写入，并以频道范围内的幂等键支持安全重试。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照；任意两个同频道快照还可经**快照差异接口**按 seq 合并比较，只返回新增 / 移除 / 内容变更的条目。快照内容如需合规输出，可调用**快照敏感词遮盖**：基于冻结生效文本在整个快照上按码点精确匹配词表，命中码点替换为 `*` 后分页返回，全程只读。需要把冻结字幕套用到剪辑时间轴时，可调用**剪辑字幕导出**：提交全部字幕的源区间 `timings` 与有序剪辑片段 `clips`，服务把每条字幕与每个片段求交集、平移到成片累计时间后返回 cue 列表或直接输出 WebVTT 文件，全程只读。下游也可以注册**命名消费者拉取游标**：每个命名消费者在频道内持有独立的已确认游标，领取接口在事务中返回游标后的连续批次（含缺口标记）并签发带过期时间的租约令牌，确认后游标才推进；租约过期未确认的批次可被重新领取，实现至少一次交付。
 
 ## 语义规则
 
@@ -58,6 +58,15 @@
 - 匹配**区分大小写、逐码点精确、不做归一化**；所有词的重叠命中都参与，覆盖区间取并集，**每个被覆盖码点替换为一个 `*`**（遮盖后码点数不变），再按各字幕原码点长度拆回原序号；未命中文字与缺口标记原样保留。
 - 先算好完整快照的遮盖，再返回 `after` 之后至多 `limit` 条字幕或缺口；还有后续条目时 `next_after` 为本页末序号，否则为 `null`。
 
+### 剪辑字幕导出规则
+
+- `POST /snapshots/{snapshot_id}/edits` 接收 `timings`（每条字幕的源时间轴区间：`seq` / `start_ms` / `end_ms`）与有序 `clips`（剪辑片段：`start_ms` / `end_ms`）；所有时间均为**非负整数毫秒**、**左闭右开**且**起点小于终点**，非法输入返回 422，快照不存在返回 404。
+- `timings` 须**恰好覆盖快照内全部字幕 seq**：缺字幕序号、序号重复或包含快照中不存在的序号（缺口序号 / 超界序号）都返回 422 `timings_mismatch`；空快照须传空 `timings`。
+- `clips` 可**重排、重复或重叠**，按输入顺序首尾拼接为成片时间轴（第 i 个片段的成片偏移 = 此前所有片段时长之和）。
+- 每条字幕与每个 clip 取**左闭右开交集**，非空才生成 cue，再平移到成片累计时间：一条字幕横跨多个 clip 时**按交集拆分**为多条 cue；重复 clip 在不同偏移处**保留副本**；时间重叠的字幕各自生成 cue，**不合并**。
+- 导出基于快照**冻结的生效文本**（与 `view=effective` 一致），是**纯只读**计算：快照与当前定稿 / 更正均不被修改。
+- 默认 `format=json` 返回结构化 cue 列表（`seq`、`clip_index`、`text`、映射后的 `start_ms` / `end_ms`），按 **(start_ms, clip_index, seq) 升序**；`format=vtt` 直接输出**合法 WebVTT** 文档（`text/vtt`），正文转义 `&` `<` `>`。
+
 ### 命名消费者拉取游标规则
 
 - 每个 `(channel, consumer)` 维护独立的已确认游标 `cursor`（初始 0）与至多一个未过期租约；消费者之间互不影响。
@@ -87,6 +96,7 @@ docker compose up --build
 - 快照内更正历史（版本升序）：`GET /snapshots/{snapshot_id}/items/{seq}/corrections`
 - 比较两个快照的差异：`GET /snapshots/{snapshot_id}/diff?other={other_id}`
 - 快照敏感词遮盖：`POST /snapshots/{snapshot_id}/redactions`
+- 剪辑字幕导出（`format=json|vtt`）：`POST /snapshots/{snapshot_id}/edits`
 - 领取消费者批次：`POST /channels/{channel}/consumers/{consumer}/claims`
 - 确认消费者批次：`POST /channels/{channel}/consumers/{consumer}/acks`
 - 查询消费者状态：`GET /channels/{channel}/consumers/{consumer}`
@@ -552,6 +562,61 @@ curl -X POST http://localhost:8000/snapshots/b1f3c2a4-..../redactions \
 - 遮盖在整个快照上一次算好再分页：`after`（默认 0）为序号游标，`limit`（默认 100，1~100）只限制返回条数，跨页词语也完整遮盖；还有后续条目时 `next_after` 为本页末序号，否则为 `null`；
 - 快照不存在返回 404 `snapshot_not_found`；词表去重后数量越界、词长越界、`after<0`、`limit` 越界返回 422。
 
+### 剪辑字幕导出（json / WebVTT）
+
+把快照冻结的生效字幕套用到剪辑时间轴：提交每条字幕的源区间 `timings` 与有序剪辑片段 `clips`，服务逐对求交集、平移到成片累计时间后返回 cue 列表，或直接输出 WebVTT 文件。只读，不修改快照。
+
+```bash
+curl -X POST 'http://localhost:8000/snapshots/b1f3c2a4-..../edits' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timings": [
+      {"seq": 1, "start_ms": 0, "end_ms": 3000},
+      {"seq": 2, "start_ms": 3000, "end_ms": 5000}
+    ],
+    "clips": [
+      {"start_ms": 1000, "end_ms": 4000},
+      {"start_ms": 0, "end_ms": 1000}
+    ]
+  }'
+```
+
+```json
+{
+  "snapshot_id": "b1f3c2a4-....",
+  "channel": "news",
+  "format": "json",
+  "duration_ms": 4000,
+  "cues": [
+    {"seq": 1, "clip_index": 0, "text": "第一条字幕", "start_ms": 0, "end_ms": 2000},
+    {"seq": 2, "clip_index": 0, "text": "第二条字幕", "start_ms": 2000, "end_ms": 3000},
+    {"seq": 1, "clip_index": 1, "text": "第一条字幕", "start_ms": 3000, "end_ms": 4000}
+  ]
+}
+```
+
+- `timings`：每条字幕在源时间轴上的左闭右开区间（毫秒），须**恰好覆盖快照内全部字幕 seq**——上例字幕 1 横跨两个 clip 被拆分为两条 cue，第二个 clip 重排了源区间 `[0,1000)` 故字幕 1 在其后再次出现；
+- `clips`：有序剪辑片段，可重排 / 重复 / 重叠，按输入顺序首尾拼接；`duration_ms` 为全部片段时长之和；
+- cue 按 `(start_ms, clip_index, seq)` 升序；`clip_index` 为片段在请求 `clips` 数组中的下标（从 0 起）；
+- 所有时间须为非负整数且起点小于终点；`timings` 缺序号 / 重复 / 含多余序号（缺口或超界）返回 422 `timings_mismatch`，快照不存在返回 404 `snapshot_not_found`。
+
+`format=vtt` 时直接返回 `text/vtt` 的 WebVTT 文档（cue 按同一顺序输出，正文转义 `&` `<` `>`）：
+
+```bash
+curl -X POST 'http://localhost:8000/snapshots/b1f3c2a4-..../edits?format=vtt' \
+  -H 'Content-Type: application/json' \
+  -d '{"timings": [{"seq": 1, "start_ms": 0, "end_ms": 1500}], "clips": [{"start_ms": 0, "end_ms": 1500}]}'
+```
+
+```vtt
+WEBVTT
+
+1
+00:00:00.000 --> 00:00:01.500
+第一条字幕
+
+```
+
 ### 领取消费者批次（claim）
 
 命名消费者从自己的已确认游标后领取连续批次，服务在同一事务内签发带过期时间的租约令牌：
@@ -632,7 +697,7 @@ curl http://localhost:8000/channels/news/consumers/worker-1
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、单条/批量更正、批量整批拒绝/幂等重试/并发、版本冲突、视图合并、审计、发布快照冻结/幂等/分页/不可变、快照差异合并/分页/错误、快照敏感词遮盖/跨字幕拼接/缺口阻断/分页/校验、消费者领取/确认/租约过期/并发、并发事务等用例
+pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、单条/批量更正、批量整批拒绝/幂等重试/并发、版本冲突、视图合并、审计、发布快照冻结/幂等/分页/不可变、快照差异合并/分页/错误、快照敏感词遮盖/跨字幕拼接/缺口阻断/分页/校验、剪辑字幕导出交集平移/拆分/副本/排序/VTT/校验、消费者领取/确认/租约过期/并发、并发事务等用例
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -648,6 +713,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - **发布快照**：`snapshots(snapshot_id, channel, watermark, idempotency_key, created_at)` 记录冻结时刻，`snapshot_items(snapshot_id, seq, …)` 对 `1..watermark` 每个序号落一行——字幕行同时存 `original_text`、创建时刻经 `MAX(version)` 连接冻结的 `effective_text` 及其 `correction_version`，缺口行存裁决区间端点；`snapshot_corrections(snapshot_id, seq, version, …)` 逐版本复制快照时刻已有的全部更正记录。创建先按 `(channel, idempotency_key)` 查重，命中即幂等返回；全部插入在一个写事务内完成，故冻结视图与锁定水位线严格一致。三张快照表各自配备 `no_update` / `no_delete` 触发器，快照一旦生成在存储层即不可变；分页与快照内审计只读取快照表，后续定稿、更正、缺口对其零影响。不存在的频道不写 `channels` 行，直接生成 `watermark=0` 的空快照。
 - **快照差异**：`GET /snapshots/{snapshot_id}/diff?other=…` 在单个只读事务内校验两快照存在且同频道（不存在 404、跨频道 409），随后用两段 `LEFT JOIN` 的 `UNION ALL` 模拟全外连接，把两份 `snapshot_items` 按 `seq` 合并：第一段覆盖“基准有 / 双方都有且有差异”，第二段补齐“仅对方有”。差异判定用 SQLite 的 NULL 安全不等号 `IS NOT` 比较冻结的 `effective_text`、`correction_version`（字幕）与 `start_seq` / `end_seq`（缺口），完全一致的行在 SQL 层即被过滤，`ORDER BY seq LIMIT` 只作用于差异行——因此 `limit` 天然只计差异条目，稀疏差异也不会漏项；`next_after` 取本页最后一条差异的 `seq` 供续拉。
 - **快照敏感词遮盖**：`POST /snapshots/{snapshot_id}/redactions` 在只读事务内取出快照 `1..watermark` 冻结的生效文本，按序号把相邻字幕（中间无缺口）无分隔拼接成分段，缺口截断分段；在每段上对去重词表（1~20 项、每项 1~128 码点）用 `str.find` 逐码点枚举全部重叠命中（每次命中后仅前进一位），覆盖区间取并集后把每个被覆盖码点替换为一个 `*`（长度不变），再按各字幕原码点长度拆回原序号。遮盖先于分页完成，`after` / `limit`（1~100）只截取结果页，`next_after` 在还有后续条目时指向本页末序号；全程不写入，快照与当前字幕不受影响。
+- **剪辑字幕导出**：`POST /snapshots/{snapshot_id}/edits` 在只读事务内取出快照内全部字幕行（`kind='subtitle'`）冻结的生效文本，先在内存中校验 `timings` 恰好覆盖其 seq 集合（重复 / 缺失 / 多余均 422 `timings_mismatch`，快照不存在 404），再按输入顺序遍历 `clips` 并维护成片累计偏移：每条字幕与当前 clip 取左闭右开交集 `[max(start), min(end))`，非空才生成 cue 并平移 `交集 - clip.start + 偏移`；跨片段自然拆分、重复 clip 在不同偏移处保留副本、重叠字幕各自成 cue 不合并，最后按 `(start_ms, clip_index, seq)` 排序返回。`format=vtt` 时把排序后的 cue 渲染为 WebVTT（`HH:MM:SS.mmm` 时间戳，正文转义 `&` `<` `>`），以 `text/vtt` 直接输出；全程不写入，快照与当前字幕不受影响。
 - **命名消费者拉取游标**：`consumers(channel, consumer, cursor, lease_token, lease_from, lease_to, lease_expires_at, …)` 每消费者一行。领取在单个 `BEGIN IMMEDIATE` 事务内「注册消费者 → 校验无未过期租约 → 复用定稿查询截取 `cursor` 后的连续批次（含缺口标记）→ 写入新租约（UUID 令牌 + 过期时刻 epoch 秒）」，并发领取同一消费者只有一个能拿到租约；确认同样单事务完成全部校验（游标一致 → 有租约 → 令牌匹配 → 未过期 → `new_cursor` 在批次范围内）后推进游标并清空租约，任何一步失败都不改写状态。租约过期由应用层按 `lease_expires_at` 判定，过期后同一未确认批次可被重新领取并签发新令牌（旧令牌随之失效），确认成功即清空租约、下一批从新游标继续，实现至少一次交付。
 - **存储**：`channels`（水位线）、`fragments`（待定稿缓冲）、`finalized`（定稿，不可变）、`gap_decisions` / `gaps`（永久缺口）、`corrections`（追加式更正）、`correction_batches` / `correction_batch_items`（批量更正批次与逐项冻结记录，不可变）、`snapshots` / `snapshot_items` / `snapshot_corrections`（不可变发布快照）、`consumers`（命名消费者拉取游标）十二张表；WAL 模式 + `busy_timeout`。建表语句与触发器均幂等（`CREATE TABLE/TRIGGER IF NOT EXISTS`），已部署实例重启后自动补建新表与触发器，原有数据与接口行为不受影响。
 - **容器化**：`docker compose up --build` 一键启动，数据库落在命名卷 `subtitles-data`；服务固定监听 **8000** 端口。

@@ -446,6 +446,76 @@ class SnapshotRedactionResponse(BaseModel):
     )
 
 
+# ---------- 剪辑字幕导出 ----------
+
+
+class EditTimingIn(BaseModel):
+    seq: int = Field(..., ge=1, description="字幕序号，须与快照内字幕 seq 一一对应")
+    start_ms: int = Field(
+        ..., ge=0, description="字幕在源时间轴上的起点（毫秒，非负整数，左闭）"
+    )
+    end_ms: int = Field(
+        ..., ge=0, description="字幕在源时间轴上的终点（毫秒，非负整数，右开，须大于起点）"
+    )
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> "EditTimingIn":
+        if self.start_ms >= self.end_ms:
+            raise ValueError("start_ms 必须小于 end_ms（左闭右开区间）")
+        return self
+
+
+class EditClipIn(BaseModel):
+    start_ms: int = Field(
+        ..., ge=0, description="剪辑片段在源时间轴上的起点（毫秒，非负整数，左闭）"
+    )
+    end_ms: int = Field(
+        ..., ge=0, description="剪辑片段在源时间轴上的终点（毫秒，非负整数，右开，须大于起点）"
+    )
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> "EditClipIn":
+        if self.start_ms >= self.end_ms:
+            raise ValueError("start_ms 必须小于 end_ms（左闭右开区间）")
+        return self
+
+
+class EditExportIn(BaseModel):
+    timings: List[EditTimingIn] = Field(
+        ...,
+        description=(
+            "全部字幕的源时间轴区间：须恰好覆盖快照内全部字幕 seq，"
+            "无缺口、无重复、无多余序号（空快照须传空数组）"
+        ),
+    )
+    clips: List[EditClipIn] = Field(
+        ...,
+        description="有序剪辑片段（可重排 / 重复 / 重叠），按输入顺序首尾拼接为成片时间轴",
+    )
+
+
+class EditCue(BaseModel):
+    seq: int = Field(..., description="字幕序号（对应快照内字幕 seq）")
+    clip_index: int = Field(
+        ..., description="所属剪辑片段在请求 clips 数组中的下标（从 0 起，按输入顺序）"
+    )
+    text: str = Field(..., description="快照冻结的生效文本")
+    start_ms: int = Field(..., description="cue 在成片时间轴上的起点（毫秒，左闭）")
+    end_ms: int = Field(..., description="cue 在成片时间轴上的终点（毫秒，右开）")
+
+
+class EditExportResponse(BaseModel):
+    snapshot_id: str
+    channel: str
+    format: Literal["json"] = Field("json", description="响应格式：json=结构化 cue 列表")
+    duration_ms: int = Field(
+        ..., description="成片总时长（全部剪辑片段时长之和，毫秒）"
+    )
+    cues: List[EditCue] = Field(
+        ..., description="成片字幕 cue，按 (start_ms, clip_index, seq) 升序"
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 

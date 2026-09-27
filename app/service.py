@@ -63,6 +63,18 @@
 - 分页在遮盖完成后进行：after/limit 只决定返回哪些条目，next_after 在
   还有后续条目时指向本页末序号，否则为 null。
 
+剪辑字幕导出（export_snapshot_edit）不变式：
+- 导出是纯只读计算：只读取 snapshot_items 中冻结的生效文本，快照表与
+  定稿 / 更正原表均不被修改；
+- timings 须恰好覆盖快照内全部字幕 seq：缺字幕序号、含重复序号或含
+  快照中不存在的序号（缺口 / 超界）都返回 422，不产生任何输出；
+- clips 按输入顺序首尾拼接为成片时间轴：每条字幕与每个 clip 取左闭
+  右开交集，非空才生成 cue 并平移到成片累计时间；一条字幕横跨多个
+  clip 时按交集拆分为多条 cue，重复 clip 在不同偏移处保留副本，
+  时间重叠的字幕各自生成 cue 不合并；
+- cue 按 (start_ms, clip_index, seq) 升序返回；format=vtt 时渲染为
+  合法 WebVTT，正文转义 & < >。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -1373,6 +1385,109 @@ def _mask_text(text: str, words: list) -> str:
                 covered[i] = True
             start = index + 1  # 每次只前进一步，重叠命中也被枚举
     return "".join("*" if covered[i] else ch for i, ch in enumerate(text))
+
+
+# ---------- 剪辑字幕导出 ----------
+
+
+def export_snapshot_edit(snapshot_id: str, timings: list, clips: list) -> dict:
+    """按剪辑时间轴导出快照字幕 cue（纯只读，不修改快照）。
+
+    timings 须恰好覆盖快照内全部字幕 seq（无缺口、无重复、无多余），
+    否则 422 timings_mismatch；clips 按输入顺序首尾拼接为成片时间轴，
+    每条字幕与每个 clip 取左闭右开交集，非空才生成 cue 并平移到成片
+    累计时间——一条字幕横跨多个 clip 时按交集拆分，重复 clip 在不同
+    偏移处保留副本，时间重叠的字幕各自生成 cue 不合并。cue 按
+    (start_ms, clip_index, seq) 升序返回。
+    """
+    with read_tx() as conn:
+        meta = _get_snapshot_meta(conn, snapshot_id)
+        rows = conn.execute(
+            "SELECT seq, effective_text FROM snapshot_items "
+            "WHERE snapshot_id = ? AND kind = 'subtitle' ORDER BY seq",
+            (snapshot_id,),
+        ).fetchall()
+    texts = {row["seq"]: row["effective_text"] for row in rows}
+
+    # timings 须恰好覆盖全部字幕 seq：无重复、无缺口、无多余
+    timing_by_seq = {}
+    for timing in timings:
+        seq = timing["seq"]
+        if seq in timing_by_seq:
+            raise SnapshotError(
+                "timings_mismatch",
+                f"timings 中序号 {seq} 重复：每个字幕 seq 须恰好出现一次",
+                status_code=422,
+            )
+        timing_by_seq[seq] = timing
+    missing = sorted(set(texts) - set(timing_by_seq))
+    extra = sorted(set(timing_by_seq) - set(texts))
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append(f"缺少字幕序号 {missing}")
+        if extra:
+            parts.append(f"包含快照中不存在的字幕序号 {extra}")
+        raise SnapshotError(
+            "timings_mismatch",
+            "timings 须恰好覆盖快照全部字幕 seq（无缺口、无多余）："
+            + "；".join(parts),
+            status_code=422,
+        )
+
+    cues = []
+    offset = 0  # 当前 clip 在成片时间轴上的起点（此前所有 clip 时长之和）
+    for clip_index, clip in enumerate(clips):
+        clip_start, clip_end = clip["start_ms"], clip["end_ms"]
+        for timing in timings:
+            start = max(timing["start_ms"], clip_start)
+            end = min(timing["end_ms"], clip_end)
+            if start < end:  # 左闭右开交集非空才生成 cue
+                cues.append(
+                    {
+                        "seq": timing["seq"],
+                        "clip_index": clip_index,
+                        "text": texts[timing["seq"]],
+                        "start_ms": start - clip_start + offset,
+                        "end_ms": end - clip_start + offset,
+                    }
+                )
+        offset += clip_end - clip_start
+
+    cues.sort(key=lambda cue: (cue["start_ms"], cue["clip_index"], cue["seq"]))
+    return {
+        "snapshot_id": snapshot_id,
+        "channel": meta["channel"],
+        "format": "json",
+        "duration_ms": offset,
+        "cues": cues,
+    }
+
+
+def render_vtt(cues: list) -> str:
+    """把排序后的 cue 列表渲染为合法 WebVTT 文档（正文转义 & < >）。"""
+    lines = ["WEBVTT", ""]
+    for number, cue in enumerate(cues, 1):
+        lines.append(str(number))
+        lines.append(
+            f"{_vtt_timestamp(cue['start_ms'])} --> {_vtt_timestamp(cue['end_ms'])}"
+        )
+        lines.append(_escape_vtt_text(cue["text"]))
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _vtt_timestamp(ms: int) -> str:
+    """毫秒转 WebVTT 时间戳 HH:MM:SS.mmm。"""
+    hours, rem = divmod(ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    seconds, millis = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def _escape_vtt_text(text: str) -> str:
+    """WebVTT 正文转义：& < > 替换为实体，避免被解析为标记或时间戳箭头。"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------- 命名消费者拉取游标 ----------

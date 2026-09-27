@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import Literal, Union
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import service
@@ -18,6 +18,8 @@ from .schemas import (
     CorrectionAuditResponse,
     CorrectionIn,
     CorrectionResponse,
+    EditExportIn,
+    EditExportResponse,
     ErrorResponse,
     FinalizedEffectiveResponse,
     FinalizedResponse,
@@ -46,8 +48,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
-    "支持追加式更正、不可变发布快照、快照敏感词遮盖与命名消费者拉取游标",
-    version="1.5.0",
+    "支持追加式更正、不可变发布快照、快照敏感词遮盖、剪辑字幕导出与命名消费者拉取游标",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -296,6 +298,50 @@ def redact_snapshot(snapshot_id: str, body: RedactionIn) -> dict:
     return service.redact_snapshot(
         snapshot_id, body.words, after=body.after, limit=body.limit
     )
+
+
+@app.post(
+    "/snapshots/{snapshot_id}/edits",
+    response_model=EditExportResponse,
+    responses={
+        404: {"description": "快照不存在", "model": ErrorResponse},
+        422: {
+            "description": "请求体校验失败（时间为负 / 起点不小于终点、"
+            "timings 未恰好覆盖全部字幕 seq 等）"
+        },
+    },
+)
+def export_snapshot_edit(
+    snapshot_id: str,
+    body: EditExportIn,
+    format: Literal["json", "vtt"] = Query(
+        "json",
+        description="json=结构化 cue 列表（默认）；"
+        "vtt=直接输出合法 WebVTT 文档（text/vtt，正文转义 & < >）",
+    ),
+):
+    """按剪辑时间轴导出快照字幕（只读，不修改快照）。
+
+    - `timings` 给出每条字幕在源时间轴上的左闭右开区间（毫秒），须恰好
+      覆盖快照内全部字幕 seq（无缺口、无重复、无多余），否则 422；
+    - `clips` 为有序剪辑片段（可重排 / 重复 / 重叠），按输入顺序首尾
+      拼接为成片时间轴；每条字幕与每个 clip 取交集，非空才生成 cue
+      并平移到成片累计时间：跨片段拆分、重复片段保留副本、重叠字幕
+      不合并；
+    - cue 按 (start_ms, clip_index, seq) 升序返回；`format=vtt` 时
+      直接输出 WebVTT 文档（text/vtt），正文转义 & < >。
+    """
+    result = service.export_snapshot_edit(
+        snapshot_id,
+        [timing.model_dump() for timing in body.timings],
+        [clip.model_dump() for clip in body.clips],
+    )
+    if format == "vtt":
+        return Response(
+            content=service.render_vtt(result["cues"]),
+            media_type="text/vtt",
+        )
+    return result
 
 
 # ---------- 命名消费者拉取游标 ----------
