@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from typing import Literal, Union
 
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from . import service
 from .db import init_db
@@ -28,6 +28,8 @@ from .schemas import (
     SnapshotCorrectionsResponse,
     SnapshotCreateIn,
     SnapshotDiffResponse,
+    SnapshotEditIn,
+    SnapshotEditResponse,
     SnapshotItemsEffectiveResponse,
     SnapshotItemsResponse,
     SnapshotRedactionResponse,
@@ -46,8 +48,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
-    "支持追加式更正、不可变发布快照、快照敏感词遮盖与命名消费者拉取游标",
-    version="1.5.0",
+    "支持追加式更正、不可变发布快照、快照敏感词遮盖、快照剪辑字幕导出"
+    "与命名消费者拉取游标",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -296,6 +299,54 @@ def redact_snapshot(snapshot_id: str, body: RedactionIn) -> dict:
     return service.redact_snapshot(
         snapshot_id, body.words, after=body.after, limit=body.limit
     )
+
+
+# ---------- 剪辑字幕导出 ----------
+
+
+@app.post(
+    "/snapshots/{snapshot_id}/edits",
+    response_model=SnapshotEditResponse,
+    responses={
+        404: {"description": "快照不存在", "model": ErrorResponse},
+        422: {
+            "description": (
+                "请求体校验失败（时间为负 / 非整数 / 起点不小于终点，"
+                "或 timings 未恰好覆盖快照全部字幕 seq）"
+            )
+        },
+    },
+)
+def export_snapshot_edit(
+    snapshot_id: str,
+    body: SnapshotEditIn,
+    format: Literal["json", "vtt"] = Query(
+        "json",
+        description="json=结构化 cue 列表（默认）；vtt=合法 WebVTT 文本（正文已转义）",
+    ),
+):
+    """按剪辑片段把快照冻结的生效字幕重排到成片时间轴（只读，不改快照）。
+
+    - `timings` 给出每条字幕在原始时间轴上的定位（seq、start_ms、
+      end_ms），须恰好覆盖快照全部字幕 seq：缺字幕、含缺口 / 越界等
+      未知 seq、同 seq 重复均返回 422；所有时间为非负整数、左闭右开
+      且起点小于终点；
+    - `clips` 为有序剪辑片段（start_ms、end_ms），可重排、重复或重叠，
+      按输入顺序首尾拼接为成片时间轴；
+    - 每条字幕与每个 clip 取交集，非空才生成 cue，再平移到该片段的
+      成片累计时间；跨片段字幕拆分、重复片段保留副本、重叠字幕不合并；
+    - cue 携带 seq、clip_index、文本与映射后的 start_ms / end_ms，
+      按 (start_ms, clip_index, seq) 升序返回；
+    - `format=vtt` 时直接返回 WebVTT 文件文本（text/vtt）。
+    """
+    result = service.export_snapshot_edit(
+        snapshot_id,
+        [timing.model_dump() for timing in body.timings],
+        [clip.model_dump() for clip in body.clips],
+    )
+    if format == "vtt":
+        return Response(content=result["vtt"], media_type="text/vtt")
+    return result
 
 
 # ---------- 命名消费者拉取游标 ----------

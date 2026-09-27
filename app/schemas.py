@@ -446,6 +446,73 @@ class SnapshotRedactionResponse(BaseModel):
     )
 
 
+# ---------- 剪辑字幕导出 ----------
+
+
+class EditTimingIn(BaseModel):
+    seq: int = Field(..., ge=1, description="字幕序号（快照中 kind=subtitle 的 seq）")
+    start_ms: int = Field(..., ge=0, description="字幕起点（毫秒，非负整数，左闭）")
+    end_ms: int = Field(..., ge=0, description="字幕终点（毫秒，非负整数，右开）")
+
+    @model_validator(mode="after")
+    def _end_after_start(self) -> "EditTimingIn":
+        if self.end_ms <= self.start_ms:
+            raise ValueError("end_ms 必须大于 start_ms（左闭右开区间，起点须小于终点）")
+        return self
+
+
+class EditClipIn(BaseModel):
+    start_ms: int = Field(..., ge=0, description="片段在原始时间轴上的起点（毫秒，非负整数，左闭）")
+    end_ms: int = Field(..., ge=0, description="片段在原始时间轴上的终点（毫秒，非负整数，右开）")
+
+    @model_validator(mode="after")
+    def _end_after_start(self) -> "EditClipIn":
+        if self.end_ms <= self.start_ms:
+            raise ValueError("end_ms 必须大于 start_ms（左闭右开区间，起点须小于终点）")
+        return self
+
+
+class SnapshotEditIn(BaseModel):
+    timings: List[EditTimingIn] = Field(
+        ...,
+        description=(
+            "每条字幕在原始时间轴上的定位：须恰好覆盖快照全部字幕 seq"
+            "（不缺、不多、不重复），缺口序号不需要也不允许出现"
+        ),
+    )
+    clips: List[EditClipIn] = Field(
+        ...,
+        description=(
+            "有序剪辑片段：按输入顺序首尾拼接为成片时间轴；"
+            "可重排、重复或重叠，重复片段在成片中保留各自副本"
+        ),
+    )
+
+
+class EditCue(BaseModel):
+    seq: int = Field(..., description="字幕序号（对应快照中的字幕 seq）")
+    clip_index: int = Field(..., description="所属剪辑片段在请求 clips 数组中的下标（从 0 起）")
+    text: str = Field(..., description="快照冻结的生效文本")
+    start_ms: int = Field(..., description="映射到成片时间轴的起点（毫秒，左闭）")
+    end_ms: int = Field(..., description="映射到成片时间轴的终点（毫秒，右开）")
+
+
+class SnapshotEditResponse(BaseModel):
+    snapshot_id: str
+    channel: str
+    duration_ms: int = Field(
+        ..., description="成片总时长（毫秒）：全部 clips 按时长首尾拼接后的累计长度"
+    )
+    cues: List[EditCue] = Field(
+        ...,
+        description=(
+            "映射到成片时间轴的字幕 cue：字幕与每个 clip 取交集，非空才生成；"
+            "跨片段拆分、重复片段保留副本、重叠字幕不合并；"
+            "按 (start_ms, clip_index, seq) 升序"
+        ),
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 
